@@ -20,6 +20,7 @@ import (
 	"github.com/daniel1302/vega-assistant/types"
 	"github.com/daniel1302/vega-assistant/uilib"
 	"github.com/daniel1302/vega-assistant/utils"
+	"github.com/daniel1302/vega-assistant/vega"
 	"github.com/daniel1302/vega-assistant/vegaapi"
 )
 
@@ -36,6 +37,8 @@ const (
 const (
 	StateSelectStartupMode State = iota
 	StateSelectHowManyBlockToSync
+	StateSelectNetworkHistoryEnabled
+	SelectDataRetention
 	StateSelectVisorHome
 	StateExistingVisorHome
 	StateSelectVegaHome
@@ -58,6 +61,8 @@ type GenerateSettings struct {
 	Mode StartupMode
 
 	NonInteractive              bool   `toml:"non-interactive"`
+	NetworkHistoryEnabled       bool   `toml:"network-history-enabled"`
+	DataRetention               string `toml:"data-retention"`
 	VisorHome                   string `toml:"visor-home"`
 	VegaHome                    string `toml:"vega-home"`
 	TendermintHome              string `toml:"tendermint-home"`
@@ -138,13 +143,13 @@ STATE_RUN:
 			if state.Settings.Mode == StartFromNetworkHistory {
 				state.CurrentState = StateSelectHowManyBlockToSync
 			} else {
-				state.CurrentState = StateSelectVisorHome
+				state.CurrentState = StateSelectNetworkHistoryEnabled
 			}
 
 		case StateSelectHowManyBlockToSync:
 			if state.Settings.NonInteractive {
 				state.logger.Info("NonInteractive: Will sync %d blocks from the network history", state.Settings.NetworkHistoryMinBlockCount)
-				state.CurrentState = StateSelectVisorHome
+				state.CurrentState = StateSelectNetworkHistoryEnabled
 
 				continue
 			}
@@ -154,7 +159,45 @@ STATE_RUN:
 				return fmt.Errorf("failed getting minimum blocks to sync from the network history: %w", err)
 			}
 			state.Settings.NetworkHistoryMinBlockCount = networkHistoryMinBlockCount
-			state.CurrentState = StateSelectVisorHome
+			state.CurrentState = StateSelectNetworkHistoryEnabled
+
+		case StateSelectNetworkHistoryEnabled:
+			if state.Settings.NonInteractive {
+				if state.Settings.NetworkHistoryEnabled {
+					state.logger.Info("Network history will be enabled")
+				} else {
+					state.logger.Info("Network history will be disabled")
+				}
+				state.CurrentState = SelectDataRetention
+
+				continue
+			}
+
+			enabledNetworkHistoryResponse, err := AskNetworkHistoryEnabled(ui)
+			if err != nil {
+				return fmt.Errorf("failed getting response to enable network history: %w", err)
+			}
+			state.Settings.NetworkHistoryEnabled = enabledNetworkHistoryResponse == uilib.AnswerYes
+
+			state.CurrentState = SelectDataRetention
+
+		case SelectDataRetention:
+			if state.Settings.NonInteractive {
+				if !vega.IsRetentionPolicyValid(state.Settings.DataRetention) {
+					state.logger.Info("Data node retention: forever")
+				} else {
+					state.logger.Infof("Data node retention: %s", state.Settings.DataRetention)
+				}
+
+				state.CurrentState = StateSelectVisorHome
+				continue
+			}
+
+			retentionPolicy, err := AskRetentionPolicy(ui)
+			if err != nil {
+				return fmt.Errorf("failed getting retention policy: %w", err)
+			}
+			state.Settings.DataRetention = retentionPolicy
 
 		case StateSelectVisorHome:
 			if state.Settings.NonInteractive {
@@ -367,7 +410,10 @@ func checkSQLCredentials(creds types.SQLCredentials) error {
 	_, err = db.QueryOne(
 		ctx,
 		pg.Scan(&timescaleVersion),
-		"SELECT installed_version FROM pg_available_extensions WHERE name = 'timescaledb'",
+		`SELECT installed_version AS extversion FROM pg_available_extensions WHERE name = 'timescaledb'
+		UNION ALL
+		SELECT extversion AS extversion FROM pg_extension WHERE extname = 'timescaledb'
+		LIMIT 1;`,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to check timescale extension version: %w", err)
